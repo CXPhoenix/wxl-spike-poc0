@@ -6,8 +6,14 @@
 #
 # Run (Windows PowerShell 5.1, no administrator rights, installs nothing):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File poc0-memprobe.ps1
+# Options:
+#   -Port 37011   use this port only (type the same number into the page's port field)
+#   -Check        only report which ports can be opened on this machine, then exit
 #
-# It listens on 127.0.0.1:47011 only (this machine, nothing on the network) and answers
+# It listens on the loopback address only (this machine, nothing on the network), on the
+# first free port of 47011, 37011, 27011, 17011 (Windows can reserve whole port ranges for
+# Hyper-V / WSL, which makes a bind fail with "address already in use" although nothing
+# is listening; the page tries the same list). It answers
 #   GET /mem   JSON with system memory, chrome.exe / msedge.exe memory by process type,
 #              and per-process GPU memory of those browsers
 #   OPTIONS    CORS / Private Network Access preflight (204)
@@ -18,11 +24,16 @@
 # in shared GPU memory; whether that is already counted in the processes' private bytes is
 # unverified, so both totals are reported.
 #
-# Requests whose Host header is not exactly 127.0.0.1:47011 or localhost:47011 are answered
+# Requests whose Host header is not exactly 127.0.0.1:<port> or localhost:<port> are answered
 # 403 (guards against DNS rebinding), in addition to the Origin allowlist.
 
+param([int]$Port = 0, [switch]$Check)
+
 $ErrorActionPreference = 'Stop'
-$Port = 47011
+$DefaultPorts = 47011, 37011, 27011, 17011   # keep in step with PROBE_PORTS in SpikePoc0.vue
+if ($Port -ne 0 -and ($Port -lt 1024 -or $Port -gt 65535)) { Write-Host "PoC 0 memprobe: -Port must be between 1024 and 65535."; exit 1 }
+$Ports = if ($Port -ne 0) { @($Port) } else { $DefaultPorts }
+$Port = 0
 $MB = 1048576
 
 function Round-MB($bytes) { [math]::Round(([double]$bytes) / $MB, 1) }
@@ -142,7 +153,7 @@ function Handle-Client($client) {
     if ($text -match "(?im)^Origin:\s*(\S+)") { $origin = $Matches[1] }
     $reqHost = ''
     if ($text -match "(?im)^Host:[ \t]*(\S+)") { $reqHost = $Matches[1] }
-    if ($reqHost -ne '127.0.0.1:47011' -and $reqHost -ne 'localhost:47011') {
+    if ($reqHost -ne "127.0.0.1:$Port" -and $reqHost -ne "localhost:$Port") {
       # Wrong or missing Host (e.g. DNS rebinding): refuse before routing.
       Send-Response $stream 403 'Forbidden' 'text/plain' 'forbidden host' $origin
     } elseif ($method -eq 'OPTIONS') {
@@ -166,8 +177,41 @@ function Handle-Client($client) {
 }
 
 # Bind to the loopback address only. TcpListener needs no URL ACL / administrator rights.
-$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
-$listener.Start()
+if ($Check) {
+  # Try to open each port for a moment. "AddressAlreadyInUse" with nothing listed by netstat
+  # usually means Windows reserved the range (Hyper-V / WSL).
+  $firstFree = 0
+  foreach ($candidate in $Ports) {
+    try {
+      $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $candidate)
+      $l.Start(); $l.Stop()
+      Write-Host "port $candidate : available"
+      if ($firstFree -eq 0) { $firstFree = $candidate }
+    } catch {
+      Write-Host "port $candidate : NOT available ($($_.Exception.InnerException.SocketErrorCode))"
+    }
+  }
+  if ($firstFree -ne 0) { Write-Host "memprobe would use port $firstFree." }
+  else { Write-Host "No port could be opened. Try another one with: -Check -Port <number between 1024 and 65535>" }
+  exit 0
+}
+
+$listener = $null
+foreach ($candidate in $Ports) {
+  try {
+    $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $candidate)
+    $l.Start()
+    $listener = $l
+    $Port = $candidate
+    break
+  } catch {
+    Write-Host "PoC 0 memprobe: port $candidate is not available ($($_.Exception.InnerException.SocketErrorCode)), trying the next one."
+  }
+}
+if (-not $listener) {
+  Write-Host "PoC 0 memprobe: none of the ports $($Ports -join ', ') could be opened. Use the manual input on the page instead."
+  exit 1
+}
 Write-Host "PoC 0 memprobe: listening on 127.0.0.1:$Port (this machine only). GET /mem returns browser and GPU memory. Press Ctrl+C to stop."
 try {
   while ($true) {
